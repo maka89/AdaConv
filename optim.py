@@ -1,7 +1,6 @@
 import torch
 import numpy as np
 from torch.optim.optimizer import Optimizer, required
-from utils import torch_refSyEv
 import copy
 
 # Base class. Behaves like Adam when used.
