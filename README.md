@@ -17,8 +17,10 @@ def get_params(self):
         l_vanilla = []
         l_cov = []
         l_cov2 = []
-        
+
+        # List of conv. weights. Include covariances within the filters of these weights.
         cov_nm=["conv1.weight","conv2.weight","conv3.weight","conv4.weight","conv5.weight","conv6.weight"]
+
         for name, param in self.named_parameters():
             
             if name in cov_nm:
