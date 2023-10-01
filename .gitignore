@@ -1,0 +1,6 @@
+*.txt
+test.py
+plot.py
+model.py
+data/
+__pycache__/

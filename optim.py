@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from torch.optim.optimizer import Optimizer, required
+from sqrt_mvp import get_inv_corr
 import copy
 
 # Base class. Behaves like Adam when used.
@@ -9,22 +10,24 @@ import copy
 # Use parameter groups to differentiate between how to
 
 
-class AdaCov(Optimizer):
+class AdaCovBase(Optimizer):
 
-    def __init__(self, params, lr=0.001, beta_1=0.9,beta_2=0.999,eps=1e-8):
+    def __init__(self, params, lr=0.001, beta_1=0.9,beta_2=0.999,eps=1e-8,num_terms=10,sigma=1.0,delta=1e-4):
         defaults = dict(lr=lr,beta_1=beta_1,beta_2=beta_2,k=0,eps=eps)
-        super(AdaCov, self).__init__(params, defaults)
+        super(AdaCovBase, self).__init__(params, defaults)
         self.beta_2 = beta_2
         self.k=0
+        self.num_terms=num_terms
+        self.delta=delta
+        self.sigma=sigma
         self.reset()
         
     def __setstate__(self, state):
-        super(AdaCov, self).__setstate__(state)
+        super(AdaCovBase, self).__setstate__(state)
         
-    def calc_cov(self,group, grad):
-        return grad*grad
-            
-    def calc_step(self,group,param_state,m,cov):
+    def update_cov(self,group,param_state, grad):
+        param_state["cov"] = group["beta_2"]*param_state["cov"]+ (1.0-group["beta_2"])*grad*grad  
+    def calc_step(self,group,param_state,m,cov,diag):
         return m/torch.sqrt(cov+group["eps"]**2)
             
         
@@ -34,8 +37,21 @@ class AdaCov(Optimizer):
             for p in group["params"]:
                 param_state = self.state[p]
                 param_state["mom"] = torch.zeros_like(p.data)
-                param_state["cov"] = self.calc_cov(group,torch.zeros_like(p.data))
                 
+                
+                if group["cov"]==1:
+                    sh = p.data.size()
+                    xx=torch.zeros_like(p.data[0,0]).reshape(1,1,sh[2]*sh[3],1)
+                    cov = torch.matmul(xx,torch.transpose(xx,-1,-2))
+                    param_state["cov"] = cov
+                    param_state["diag"] = torch.zeros_like(p.data)
+                    assert(sh[2]==sh[3])
+                    param_state["Kinvh"] = torch.zeros_like(cov[0,0])
+                    get_inv_corr(sh[2],param_state["Kinvh"],sigma=self.sigma,delta=self.delta)
+                    param_state["Kinvh"]=param_state["Kinvh"].reshape(1,1,sh[2]*sh[3],sh[2]*sh[3])
+                    param_state["Kinvh"]= param_state["Kinvh"]+torch.zeros_like(cov)
+                else:
+                    param_state["cov"] = torch.zeros_like(p.data)
 
     def step(self, closure=None):
 
@@ -58,20 +74,18 @@ class AdaCov(Optimizer):
                 g=p.grad
                 param_state = self.state[p]
                 
+                torch.add(param_state["mom"]*beta_1,g,alpha=1.0-beta_1,out=param_state["mom"]) #First order momen
+                self.update_cov(group,param_state,g) #Second order moment
                 
-                v = param_state['mom']
-                cov = param_state["cov"]
+                vub   =  param_state["mom"]/(1.0-beta_1**group["k"])
+                covub = param_state["cov"]/(1.0-beta_2**group["k"])
+                if group["cov"]==1:
+                    torch.addcmul(beta_2*param_state["diag"], g,g,value=1.0-beta_2, out=param_state["diag"])
+                    diagub = param_state["diag"]/(1.0-beta_2**group["k"])
+                else:
+                    diagub = None
                 
-                v = beta_1*v + (1.0-beta_1)*g
-                vub   = v/(1.0-beta_1**group["k"])
-                
-                cov = beta_2*cov + (1.0-beta_2)*self.calc_cov(group,g)
-                covub = cov/(1.0-beta_2**group["k"])
-                
-                param_state["mom"] = v
-                param_state["cov"] = cov
-                
-                gg = self.calc_step(group,param_state,vub,covub)
+                gg = self.calc_step(group,param_state,vub,covub,diagub)
 
                 p.data = p.data - lr*gg
         
@@ -80,17 +94,16 @@ class AdaCov(Optimizer):
 
 # Includes Covariances between individual convolutional filters.
 # I.e. [n_out,n_in,W,H] becomes n_out x n_in covariance matrices of size [WxH,WxH]   
-class AdaConv(AdaCov):
+class AdaConv(AdaCovBase):
 
-    def calc_cov(self,group, grad):
+    def update_cov(self,group,param_state,grad):
         if group["cov"]==1:
             sh=grad.data.size()
-            xx=grad.reshape(sh[0],sh[1],sh[2]*sh[3],1)
-            return torch.matmul(xx,torch.transpose(xx,3,2))
+            
         else:
-            return grad*grad
+            torch.addcmul(group["beta_2"]*param_state["cov"], grad,grad,value=(1.0-group["beta_2"]), out=param_state["cov"])
         
-    def calc_step(self,group,param_state,m,cov):
+    def calc_step(self,group,param_state,m,cov,diag):
         if group["cov"]==1:
         
             if "eye" in param_state.keys():
@@ -103,28 +116,17 @@ class AdaConv(AdaCov):
         
             sh=m.data.size()
  
-            covd = cov*idm
-            cov1 = cov
             
-            
-            a = 10.0**(-(group["k"]/300))
-            cov2 = covd*a+(1.0-a)*cov1
-            
-            init_diag = np.log10(group["eps"]**2)
-            final_diag = -10
-            add_diag = init_diag + (final_diag-init_diag)*(1.0-np.exp(-0.5*(group["k"]/300)**2))
-            add_diag = 10.0**add_diag
-            add_diag = max(add_diag,final_diag)
-            
-            cov2 = cov2 + idm*add_diag
-            
-            w,q = torch.linalg.eigh(cov2)
-
-            w = w.reshape(sh[0],sh[1],sh[2]*sh[3],1)
             
             gx = m.reshape(sh[0],sh[1],sh[2]*sh[3],1)
-            gg = w**-0.5*torch.matmul(torch.transpose(q,3,2),gx)
-            gg = torch.matmul(q,gg)
+            d = diag.reshape(sh[0],sh[1],sh[2]*sh[3],1)+1e-10#group["eps"]**2
+
+            
+            d_inv_sqrt = d**-0.5
+            d_qrt = d**0.25
+    
+            
+            gg = torch.matmul(param_state["Kinvh"], gx/d_qrt)/d_qrt
             gg = gg.reshape(sh[0],sh[1],sh[2],sh[3])
 
             
